@@ -1,4 +1,5 @@
 ## Distributed Vector Search Service — One-page Service Contract
+(Note: ChapGPT initial generator)
 
 ### 1) Purpose
 
