@@ -80,7 +80,9 @@ Provide low-latency approximate nearest-neighbor (ANN) search over **1B 768-dim 
 ```json
 {
   "results": [
-    { "id":"p123", "score":0.812, "tags":{...}, "version":42 }
+    { "id":"p123", "score":0.812, "tags":{...}, "version":42 },
+    { "id":"p456", "score":0.812, "tags":{...}, "version":42 },
+    ...
   ],
   "took_ms": 18,
   "partial": false
@@ -108,8 +110,10 @@ Provide low-latency approximate nearest-neighbor (ANN) search over **1B 768-dim 
 {
   "tenant_id":"t1",
   "index":"main",
-  "points":[
-    {"id":"p123","vector":[...],"tags":{"lang":"en"}, "version":42}
+  "vectors":[
+    {"id":"p123","vector":[...],"tags":{"lang":"en"}, "version":42},
+    {"id":"p456","vector":[...],"tags":{"lang":"en"}, "version":42},
+    ...
   ]
 }
 ```
@@ -205,8 +209,4 @@ Provide low-latency approximate nearest-neighbor (ANN) search over **1B 768-dim 
 * **No cross-tenant queries**; no joins/aggregations/analytics.
 * **No per-request custom distance functions** beyond configured metric.
 * **No guarantee of stable ordering** when scores tie (except deterministic per shard best-effort).
-
----
-
-If you want, next I can append the “staff-engineer design sketch” behind this contract (sharding, IVF-PQ/HNSW choice, memory budget, tombstone propagation path, and how to hit 50ms p95 at 5k burst), but the above is the contract clients can build against.
 
