@@ -37,7 +37,7 @@ Provide low-latency approximate nearest-neighbor (ANN) search over **1B 768-dim 
 
 ### 3) Data Model
 
-**Identity & tenancy**
+**Identity and tenancy**
 
 * `tenant_id` (required), `id` (unique within tenant)
 
@@ -139,13 +139,13 @@ Provide low-latency approximate nearest-neighbor (ANN) search over **1B 768-dim 
 
 #### 4.4 Management / Quotas / Health
 
-* `GET /v1/tenants/{tenant_id}/quota` (limits & current usage)
+* `GET /v1/tenants/{tenant_id}/quota` (limits and current usage)
 * `GET /v1/indexes/{index}/stats` (size, shard map, build lag, delete-lag)
 * `GET /healthz` (liveness), `GET /readyz` (readiness)
 
 ---
 
-### 5) Scoring & Filtering Semantics
+### 5) Scoring and Filtering Semantics
 
 **Vector similarity**
 
@@ -169,7 +169,7 @@ Provide low-latency approximate nearest-neighbor (ANN) search over **1B 768-dim 
 
 ---
 
-### 6) Consistency & Delete Enforcement (explicit contract)
+### 6) Consistency and Delete Enforcement (explicit contract)
 
 **Read staleness**
 
@@ -185,7 +185,7 @@ Provide low-latency approximate nearest-neighbor (ANN) search over **1B 768-dim 
 
 ---
 
-### 7) Multi-tenant Quotas & Isolation
+### 7) Multi-tenant Quotas and Isolation
 
 **Quotas (per tenant)**
 
