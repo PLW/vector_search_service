@@ -98,13 +98,14 @@ Provide low-latency approximate nearest-neighbor (ANN) search over **1B 768-dim 
 
 **Errors**
 
-* `429` tenant throttled (quota / overload)
-* `400` bad dim / invalid filters / unsupported hybrid options
-* `503` overloaded (after throttling policies applied)
+* `400` Bad Request - bad dim / invalid filters
+* `429` Too Many Requests - tenant throttled (quota limit)
+* `501` Not Implemented - v1 operations only
+* `503` Service Unavailable - overload (after throttling) / maintenance 
 
 #### 4.2 Upsert / Insert
 
-`POST /v1/upsert`
+`POST /v1/upsert
 
 ```json
 {
