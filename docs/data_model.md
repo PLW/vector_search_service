@@ -12,6 +12,10 @@ Requirements:
 Specify: segment file layout, in-memory structures, tombstones,
   manifest, and compaction triggers.
 
+Layout format: all data items in each file should be specified as
+  TYPE: NAME, NAME, ..
+  For example: `u64 segid, tenant_id, shard_id`
+
 Provide a state machine for “segment lifecycle”.
 ```
 
