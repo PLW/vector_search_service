@@ -1,7 +1,19 @@
 # Distributed Vector Store
+## Index storage format: immutable segments, background compaction
 
-## Storage/index format: immutable segments + background compaction
-(Note: initial generation by ChatGPT LLM)
+Generated from initial ChatGPT prompt:
+```
+Define the index storage format as immutable segments + background compaction.
+Requirements:
+  - Upserts and deletes supported
+  - Deletes visible in <=4s
+  - Rebuilds should not block queries
+
+Specify: segment file layout, in-memory structures, tombstones,
+  manifest, and compaction triggers.
+
+Provide a state machine for “segment lifecycle”.
+```
 
 ### 0) High-level shape
 

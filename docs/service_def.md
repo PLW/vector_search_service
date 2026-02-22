@@ -1,4 +1,4 @@
-## Distributed Vector Search Service — One-page Service Contract
+## Distributed Vector Search Service
 
 Initially generated via ChatGPT with the following prompt:
 
