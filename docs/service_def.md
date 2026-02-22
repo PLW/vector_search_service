@@ -1,5 +1,22 @@
 ## Distributed Vector Search Service — One-page Service Contract
-(Note: ChapGPT initial generator)
+
+Initially generated via ChatGPT with the following prompt:
+
+```
+You are my staff engineer partner.
+Design a distributed vector search service.
+Constraints:
+  - Query latency p95 < 50ms for topK=20
+  - QPS target 2k, burst 5k
+  - Data: 1B vectors, dim=768, float16 storage allowed
+  - Support: insert/upsert, delete, metadata filters (small set of tags),
+    hybrid scoring optional
+  - Multi-tenant (tenant_id), per-tenant quotas
+  - Consistency: queries may be slightly stale (bounded), but deletes must
+    take effect within 5 seconds
+Produce: a one-page “service contract” with SLOs, API semantics, and explicit non-goals.
+```
+
 
 ### 1) Purpose
 
