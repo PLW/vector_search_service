@@ -19,292 +19,254 @@ Layout format: all data items in each file should be specified as
 Provide a state machine for “segment lifecycle”.
 ```
 
-### 0) High-level shape
+## Immutable-segment index format + background compaction
 
-Each **shard** owns a stream of **immutable segments** (LSM-ish), plus a **tombstone overlay** to guarantee deletes in ≤4s. Queries run against a *stable snapshot* (manifest version) + live tombstone set; compaction builds new segments off to the side and atomically swaps manifests (no query blocking).
+### Design goals
+
+* **Immutable segments** (LSM-style) for safe concurrent reads and cheap atomic publishes.
+* **Deletes visible ≤ 4s** via a replicated tombstone overlay that queries must consult.
+* **Rebuilds/compactions never block queries**: build new segments off to the side, then atomically swap manifests; queries use snapshot pointers.
 
 ---
 
-## 1) Segment file layout (on object store or local NVMe + replicated)
+## 1) Segment file layout (per shard, per segment `seg_<segid>/`)
 
-A segment is a directory/prefix `seg_<segid>/` containing:
+All files are written, checksummed, then a `SEALED` marker is created last.
 
-1. **`segment.meta`** (small protobuf/flatbuffer, checksummed)
+### Core metadata
 
-* `segid`, `tenant_id` (or “mixed-tenant” flag if you pack), `shard_id`
-* `build_time`, `format_version`
-* `vector_dim=768`, `metric` (cos/dot)
-* `n_points_total`
-* `docid_min/max` (internal)
-* `tag_schema_hash` (allowlisted keys & enum maps version)
-* Bloom params / filter stats
+* **`segment.meta`** (small, checksummed; protobuf/flatbuffer)
 
-2. **`docstore.bin`** (point records, append-only)
+  * `segid`, `shard_id`, `tenant_partition` (or “mixed-tenant” flag)
+  * `format_version`
+  * `dim=768`, `metric` (cos/dot), `vector_dtype=f16`
+  * `n_points`
+  * `build_time`, `min_version/max_version`
+  * `tag_schema_version/hash` (allowlisted keys + enum maps)
+  * stats: tag cardinalities, IVF/HNSW params, CRCs, bloom params
 
-* Fixed record header: `docid u32`, `id_hash u64`, `version u64`, `vector_off u64`, `tags_off u64`
-* Optional: `external_id` stored in `id_table` below (docstore keeps only hash + docid)
-* This is the authoritative mapping for docid→(id/version/vector/tags)
+### Point store (authoritative mapping)
 
-3. **`vectors.f16`** (dense)
+* **`docstore.rec`**
 
-* Contiguous float16 array: `[n_points][768]` aligned (e.g., 64B)
-* Optional per-segment quantization artifacts (PQ codes) if used.
+  * Record per point (fixed or var):
 
-4. **ANN index files** (choose one family; layout below supports both)
+    * `docid u32` (segment-local)
+    * `id_hash u64` (hash of external id; optional external-id reference)
+    * `version u64`
+    * `vector_offset u64` (into vectors file)
+    * `tags_offset u64`
+* **`ids.str` + `ids.off`** (optional, if you need exact external IDs, not just hash)
+* **`docstore.idx`** (optional accel): `id_hash -> docid` (sorted table or mphf)
 
-* **IVF-PQ path**
+### Vectors
 
-  * `coarse_centroids.f32` (Kc x 768)
-  * `ivf_lists.idx` (offset table per list)
-  * `ivf_lists.codes` (PQ codes per vector in posting order)
-  * `ivf_lists.docids` (docid per code, parallel array)
+* **`vectors.f16`**: contiguous `[n_points][768]` float16, aligned (64B+).
 
-* **HNSW path**
+### ANN index (choose one family per index)
 
-  * `hnsw.graph` (levels + adjacency lists)
-  * `hnsw.entrypoints` (per level)
-  * `hnsw.docids` (node→docid)
+**IVF-PQ variant**
 
-5. **Tag filter index**
+* `coarse_centroids.f32`
+* `ivf.list_off` (K lists offsets)
+* `ivf.docids` (docids in list order)
+* `ivf.codes` (PQ codes aligned with docids)
+* (optional) `residuals.f16` or `opq.mat` if used
 
-* Tags are low-cardinality; store per-key dictionary and per-value postings:
+**HNSW variant**
 
-  * `tags.dict` (key→value dictionary, value→value_id)
-  * `tags.postings` (value_id → roaring bitmap of docids) OR (value_id → sorted docid list + skip)
-  * `tags.stats` (counts)
-* Keep this *segment-local* and composable (AND across keys done by intersecting bitmaps/lists).
+* `hnsw.levels` / `hnsw.graph` (adjacency lists)
+* `hnsw.entry` (entry points)
+* `hnsw.node_docid` (node -> docid)
 
-6. **`id_table`** (optional, for fast external-id→docid lookups inside segment)
+### Tag filter index (small set of tags, low-ish cardinality)
 
-* `id_hash -> docid` minimal perfect hash or sorted table + binary search
-* If you need exact external IDs, also store `external_id` string table:
+* **`tags.dict`**: per-key value dictionary (`value -> value_id`)
+* **`tags.postings`**: `value_id -> roaring bitmap(docid)` (or sorted lists + skip)
+* **`tags.stats`**: counts to short-circuit segments with no matches
 
-  * `ids.strings` (concatenated) + `ids.offsets`
+### Integrity / sealing
 
-7. **`checksums`** / `manifest_ref`
-
-* Per-file checksums; a final “sealed” marker `SEALED` written last.
+* **`checksums`**: per-file CRC/xxhash
+* **`SEALED`**: empty file written last (commit marker)
 
 **Segment invariants**
 
 * Immutable after `SEALED`.
-* Contains **only latest-known versions at build time** (compaction enforces), but queries still must consult tombstones (and optional version overlay).
+* Segment may contain older versions (esp. L0); read path must enforce last-write-wins and deletes via overlays until compaction cleans it up.
 
 ---
 
-## 2) In-memory structures (query-serving on each shard replica)
+## 2) In-memory structures (per shard replica)
 
-### 2.1 Manifest snapshot
+### 2.1 Manifest snapshot pointer
 
-* **`Manifest`**: current active set of segments for shard (and per tenant, if partitioned).
+* `Atomic<Arc<ManifestSnapshot>> current_manifest`
+* Snapshot contains:
 
-  * `active_segments: [segid...]` ordered by “recency” / level
-  * Per segment: memory-mapped handles for ANN + tags + docstore indexes
-* Query uses `(manifest_version, tombstone_epoch)` as a consistent read view.
+  * `manifest_version`
+  * ordered `active_segments[]` with mmap handles + per-segment cached headers
+  * `level`/tier metadata
+* Queries grab a snapshot pointer and never block on swaps.
 
-### 2.2 Tombstone overlay (hard delete ≤4s)
+### 2.2 In-memory “delta” (mutable) segment for fresh writes
 
-Two-tier design to meet the 4s rule without touching segments:
+* **Memtable / DeltaIndex**
 
-1. **Hot tombstone set (RAM, replicated)**
+  * `id_hash -> (version, doc_record_ptr)`
+  * vector store for newly ingested points (float16 or float32 in RAM)
+  * small ANN structure (e.g., HNSW-in-RAM) OR brute-force block scan for small N
+  * tag postings maintained incrementally (bitsets/roaring)
+* Periodically flushed into an immutable **L0 segment**.
 
-* Key: `(tenant_id, external_id_hash)` or `(tenant_id, internal_point_key)`
-* Value: `delete_version`, `delete_time`, optional `reason`
-* Data structure: sharded concurrent hash set + time wheel / min-heap for expiry.
-* This is what queries check synchronously.
+### 2.3 Tombstones (to guarantee delete ≤4s)
 
-2. **Warm tombstone log (durable)**
+Two-tier tombstone system:
 
-* Append-only log per shard (or per tenant partition) persisted to WAL / replicated log.
-* Replayed on restart to rebuild hot set quickly.
-* Periodically compacted to a checkpoint file `tombstones.chkpt`.
+1. **Hot Tombstone Map (RAM)**
 
-**Lookup on query**
+* Key: `(tenant_id, id_hash)`
+* Value: `delete_version`, `delete_time`
+* Concurrent hash map + time-index for retention/eviction.
+* Queried synchronously on every candidate before returning.
 
-* After ANN returns candidate docids, resolve to `id_hash/version` via docstore index, then:
+2. **Durable Tombstone Log / WAL**
 
-  * If `tombstone.contains(tenant_id, id_hash)` with `delete_version >= candidate_version` → drop.
-* (Optional) also consult `upsert_version_map` if you choose to support strict last-write-wins at read time.
+* Replicated append-only log (per shard) of deletes (and optionally upserts).
+* Periodic checkpoint `tombstone.chkpt` to bound replay time.
 
-### 2.3 Upsert version overlay (optional but recommended)
+**Delete visibility contract**
 
-To avoid returning stale older versions until compaction catches up:
+* Delete is *acknowledged* only after:
 
-* `LatestVersionMap`: `(tenant_id,id_hash)->latest_version` (and maybe `latest_doc_pointer` if you keep an in-memory “delta segment”).
-* During search, drop candidates whose `candidate_version < latest_version_map[...]`.
-* This can be bounded in size with per-tenant quotas and periodic snapshotting.
+  * quorum commit in replicated log **and**
+  * applied to hot tombstone map on all query-serving replicas for that shard (or routing ensures only caught-up replicas serve queries).
+* This is what makes “≤4s” enforceable.
 
----
+### 2.4 Latest-version overlay (recommended)
 
-## 3) Manifest format (atomic swaps; rebuilds never block queries)
-
-A shard has a **manifest log** plus periodic checkpoints.
-
-### 3.1 `manifest.chkpt` (protobuf/flatbuffer)
-
-* `manifest_version`
-* `segments_active`: list of `segid`, `level`, `min/max id_hash` (optional), `n_points`, `build_time`
-* `segments_inflight`: (optional) segids being built; **not query-visible**
-* `tag_schema_version`
-* `tombstone_checkpoint_ref` (for fast bootstrap)
-* `compaction_policy_state` (optional stats)
-
-### 3.2 `manifest.log` (append-only)
-
-Records:
-
-* `ADD_SEGMENT(segid, level, file_refs, stats)`
-* `REMOVE_SEGMENT(segid)`
-* `PROMOTE_SEGMENT(segid, new_level)` (optional)
-* `SET_SCHEMA(tag_schema_version)`
-* `SET_TOMBSTONE_CHECKPOINT(ref)`
-
-**Atomicity**
-
-* Build new segment → write files → write `SEALED` → then append `ADD_SEGMENT` to manifest log.
-* Compaction swap = append `ADD_SEGMENT(newseg)` then `REMOVE_SEGMENT(oldsegs...)` in a single “transaction record” (or bracket with `BEGIN/COMMIT`).
-
-**Query non-blocking**
-
-* Query threads hold an `Arc<ManifestSnapshot>` pointer; swaps are atomic pointer flips.
-* Old snapshots remain valid until refcount drops; segments are garbage collected later.
+* `LatestVersionMap: (tenant_id,id_hash) -> latest_version`
+* Used at query-time: discard candidates whose `candidate.version < latest_version`.
+* Keeps correctness (last-write-wins) even when older segments still contain stale versions.
 
 ---
 
-## 4) Write path: inserts/upserts/deletes
+## 3) Manifest (atomic publish / non-blocking swaps)
 
-### 4.1 Upsert / insert
+### 3.1 Structures
 
-* Append to **memtable / delta segment builder**:
+* **`manifest.chkpt`** (full state snapshot)
 
-  * Either a small in-memory HNSW (fast ingest) or buffered vectors + periodic flush to immutable segment.
-* Update `LatestVersionMap` for `(tenant,id_hash)` with new version.
-* When flush triggers, create **Level-0** segment:
+  * `manifest_version`
+  * `active_segments`: `(segid, level, stats, file_refs)`
+  * `tag_schema_version`
+  * pointers to tombstone checkpoint, WAL truncation point
+* **`manifest.log`** (append-only)
 
-  * Contains new vectors + tags + docstore + ANN structure.
-  * Sealed and added to manifest.
+  * `ADD_SEGMENT(segid, level, stats, refs)`
+  * `REMOVE_SEGMENT(segid)`
+  * `SET_SCHEMA(version)`
+  * `SET_TOMBSTONE_CHECKPOINT(ref)`
+  * (optional) `BEGIN_TXN/COMMIT_TXN` for atomic multi-record swaps
 
-### 4.2 Delete
+### 3.2 Publish protocol (never blocks queries)
 
-* Append to tombstone WAL; replicate.
-* Apply to Hot tombstone set immediately (on ack path).
-* Also update `LatestVersionMap` if you treat delete as a versioned write.
-* Compaction will eventually drop deleted entries physically.
+1. Build segment off to the side → write files → `checksums` → `SEALED`
+2. Append `ADD_SEGMENT` to manifest log (durable/replicated)
+3. Atomically swap `current_manifest` pointer to new snapshot
+4. Old snapshot remains valid until refcount drops
 
-**Delete visibility guarantee**
-
-* Query nodes must subscribe to tombstone replication stream; enforce “ack after quorum applied on query-serving replicas”.
-* Target: 4s worst-case including replication + apply.
+Rebuilds follow the same: build new segments in parallel, then manifest flip.
 
 ---
 
-## 5) Compaction triggers & policy
+## 4) Compaction triggers (LSM policy)
 
-Think LSM with levels:
+Segments are tiered: **L0 (fresh, overlapping)** → **L1/L2… (larger, fewer)**.
 
-* **L0**: many small fresh segments (fast flush, high overlap).
-* **L1/L2/...**: fewer larger segments, disjoint by key range (or hashed partitions).
+Trigger compaction when any threshold is exceeded:
 
-### 5.1 Triggers
+1. **L0 count/bytes**
 
-1. **L0 count / size**
+* `L0_segments > N0` or `L0_bytes > B0` (controls read amplification)
 
-* If `L0_segments > N` or `L0_bytes > B`, schedule compaction of a batch.
+2. **Duplicate/version pressure**
 
-2. **Overlap / duplicate pressure**
-
-* If `duplicate_rate` (older versions) estimated high (via LatestVersionMap sampling), compact sooner.
+* sample-based estimate of stale versions high (many candidates dropped by LatestVersionMap)
 
 3. **Tombstone pressure**
 
-* If `tombstone_hit_rate` in queries > threshold OR tombstone set size > threshold → compact to reclaim.
+* hot tombstone map size grows beyond threshold
+* high tombstone-hit-rate observed in queries (wasted work)
 
-4. **Read amplification / latency regression**
+4. **Latency regression**
 
-* If p95 query time rises due to too many segments, compact.
+* p95 query cost rises due to segment fanout; compact to reduce segment count
 
-5. **Time-based**
+5. **Age-based smoothing**
 
-* Periodic compaction window to smooth tail latency.
+* periodic compaction to avoid bursty large merges
 
-### 5.2 What compaction does
+### Compaction operation
 
-Given input segments S1..Sk:
+Input: a set of segments `{S1..Sk}`.
 
-* Merge docstores by `(tenant_id,id_hash)` keeping only max `version` not tombstoned.
-* Rebuild tag postings for surviving docids.
-* Rebuild ANN index for the output segment.
-* Emit new segment `Sout` at higher level; atomically manifest swap.
-
-**Important:** compaction does *not* need to block queries; it reads old segments via mmap and writes new files elsewhere.
+* Merge by `(tenant_id,id_hash)` keeping only max version not tombstoned.
+* Rebuild tag postings on survivors.
+* Rebuild ANN index (IVF/HNSW) for output `Sout` (higher level).
+* Publish: `ADD_SEGMENT(Sout)` + `REMOVE_SEGMENT(S1..Sk)` atomically in manifest log.
+* Physical deletion of old segments deferred until no snapshots reference them.
 
 ---
 
-## 6) Segment lifecycle state machine
-
-Per segment `segid`, maintained by the shard’s segment manager.
+## 5) Segment lifecycle state machine
 
 ### States
 
-1. **`ALLOCATED`**
+1. **ALLOCATED**
 
-* segid reserved; directory/prefix created; not visible.
+* segid reserved, location chosen; not visible.
 
-2. **`BUILDING`**
+2. **BUILDING**
 
-* Writing vectors/docstore/index/tag postings.
-* Segment is *not* queryable.
+* writing vectors/docstore/tags/ANN; may crash safely.
 
-3. **`SEALED`**
+3. **SEALED**
 
-* All files written, checksummed, `SEALED` marker present.
-* Still not queryable until manifest add.
+* all files complete + checksummed + `SEALED` marker present; still not query-visible.
 
-4. **`PUBLISHED`**
+4. **PUBLISHED**
 
-* `ADD_SEGMENT` committed to manifest; segment becomes query-visible in new snapshots.
+* referenced by a committed manifest snapshot; query-visible.
 
-5. **`DEPRECATED`**
+5. **DEPRECATED**
 
-* Segment has been superseded by compaction (or schema migration).
-* It may still be referenced by older manifest snapshots; must remain readable.
+* removed from latest manifest by compaction/rebuild; may still be referenced by older snapshots.
 
-6. **`RECLAIMABLE`**
+6. **RECLAIMABLE**
 
-* No live manifest snapshot references it (refcount==0) AND retention grace period passed.
+* not referenced by any live snapshot (refcount==0) and retention grace passed.
 
-7. **`DELETING`**
+7. **DELETING**
 
-* Physical deletion of files/prefix in progress (or mark-for-delete in object store).
+* GC worker deleting underlying files/prefix.
 
-8. **`DELETED`**
+8. **DELETED**
 
-* Files removed; terminal.
+* terminal.
 
-### Transitions (events)
+### Transitions
 
-* `ALLOCATED -> BUILDING` : builder starts
-* `BUILDING -> SEALED` : finalize + checksums + write `SEALED`
-* `SEALED -> PUBLISHED` : manifest transaction commits `ADD_SEGMENT`
-* `PUBLISHED -> DEPRECATED` : manifest commits swap removing it (compaction) or `REMOVE_SEGMENT`
-* `DEPRECATED -> RECLAIMABLE` : segment manager observes no snapshot refs
-* `RECLAIMABLE -> DELETING` : GC worker starts deletion
-* `DELETING -> DELETED` : delete complete
+* `ALLOCATED -> BUILDING` : segment builder starts
+* `BUILDING -> SEALED` : finalize + write `SEALED`
+* `SEALED -> PUBLISHED` : manifest commits `ADD_SEGMENT`
+* `PUBLISHED -> DEPRECATED` : manifest commits swap removing it
+* `DEPRECATED -> RECLAIMABLE` : no snapshot references remain
+* `RECLAIMABLE -> DELETING` : GC begins
+* `DELETING -> DELETED` : deletion complete
 
-### Failure handling (key non-blocking rules)
+### Failure rules (key to “rebuilds don’t block queries”)
 
-* Crash in `BUILDING`: segment ignored (no `SEALED`), safe to GC.
-* Crash after `SEALED` but before `PUBLISHED`: safe; recovery can either publish (if intended) or GC if orphaned (no manifest reference).
-* Crash during manifest swap: use manifest log transaction semantics (BEGIN/COMMIT) to ensure atomic visibility.
-* Queries always operate on last committed manifest snapshot; rebuilds cannot partially surface.
-
----
-
-## 7) Notes on “rebuilds shouldn’t block queries”
-
-* “Rebuild” (e.g., ANN parameter change or schema change) is implemented as **shadow build**:
-
-  * Build new segments in parallel, publish alongside old under a new “index epoch”, then flip routing once warm.
-* Queries hold snapshot pointers; no global locks.
-* If you need per-tenant rebuild, you can flip only that tenant’s routing table.
-
+* Crash in `BUILDING`: ignore (no `SEALED`), GC later.
+* Crash after `SEALED` but before `PUBLISHED`: orphan; recovery can GC or publish if referenced by manifest intent.
+* Manifest swap uses transactional log records so queries only ever see fully committed segment sets.
